@@ -123,7 +123,7 @@ impl ServerSession {
 					let receive_progress = ReceiveProgress::shared(&transfers);
 					log_receiving_start(transfers.len(), Compression::from(compression), &receive_progress);
 					let receive_state = ReceiveState::new(transfers, resume_path);
-					let (tx, rx) = mpsc::channel(1024);
+					let (tx, rx) = mpsc::channel(4096);
 					let writer = Writer::new(receive_state, receive_progress.clone());
 					let writer = tokio::spawn(writer.run_worker(rx));
 					let mut streams = JoinSet::new();
