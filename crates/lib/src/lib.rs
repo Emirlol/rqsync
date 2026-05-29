@@ -64,6 +64,57 @@ pub struct FileManifestEntry {
 	pub rel_path: Vec<String>,
 }
 
+pub trait ManifestEntry {
+	fn id(&self) -> u32;
+	fn uncompressed_size(&self) -> u64;
+	fn rel_path_len(&self) -> usize;
+	fn rel_path_component(&self, index: usize) -> &str;
+}
+
+impl ManifestEntry for FileManifestEntry {
+	#[inline(always)]
+	fn id(&self) -> u32 {
+		self.id
+	}
+
+	#[inline(always)]
+	fn uncompressed_size(&self) -> u64 {
+		self.uncompressed_size
+	}
+
+	#[inline(always)]
+	fn rel_path_len(&self) -> usize {
+		self.rel_path.len()
+	}
+
+	#[inline(always)]
+	fn rel_path_component(&self, index: usize) -> &str {
+		&self.rel_path[index]
+	}
+}
+
+impl ManifestEntry for ArchivedFileManifestEntry {
+	#[inline(always)]
+	fn id(&self) -> u32 {
+		self.id.to_native()
+	}
+
+	#[inline(always)]
+	fn uncompressed_size(&self) -> u64 {
+		self.uncompressed_size.to_native()
+	}
+
+	#[inline(always)]
+	fn rel_path_len(&self) -> usize {
+		self.rel_path.len()
+	}
+
+	#[inline(always)]
+	fn rel_path_component(&self, index: usize) -> &str {
+		&self.rel_path[index]
+	}
+}
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(derive(Debug))]
 pub struct RejectedTransfer {

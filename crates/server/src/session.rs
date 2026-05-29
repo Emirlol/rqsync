@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{
 	bail,
+	ensure,
 	Context,
 };
 use bytes::Bytes;
@@ -21,7 +22,7 @@ use lib::{
 	ArchivedClientMessage,
 	ClientMessage,
 	Compression,
-	FileManifestEntry,
+	ManifestEntry,
 	PacketError,
 	PacketHandler,
 	RejectReason,
@@ -72,48 +73,39 @@ impl ServerSession {
 
 	pub async fn run(&mut self) -> anyhow::Result<()> {
 		self.accept_control_stream().await?;
-		loop {
-			let msg = self.read_control().await?;
-			self.handle_message(msg).await?;
-		}
-	}
+		self.handshake().await?;
+		self.register_transfers().await?;
+		self.finish_and_reconcile().await?;
+		let _ = self.conn.closed().await;
 
-	async fn read_control(&mut self) -> anyhow::Result<ClientMessage> {
-		let Some((_, ref mut recv)) = self.control else {
-			return Err(anyhow::anyhow!("No control stream available"));
-		};
-		let frame = Self::read_frame(recv, MAX_CONTROL_FRAME_SIZE).await?;
-		let message = rkyv::from_bytes::<ClientMessage, rancor::Error>(&frame).context("Failed to deserialize control message")?;
-		Ok(message)
-	}
-
-	async fn write_control(&mut self, message: ServerMessage) -> anyhow::Result<()> {
-		let Some((ref mut send, _)) = self.control else {
-			return Err(anyhow::anyhow!("No control stream available"));
-		};
-		let message = rkyv::to_bytes::<rancor::Error>(&message).context("Failed to serialize control message")?;
-		Self::write_frame(send, &message).await?;
 		Ok(())
 	}
 
-	async fn accept_control_stream(&mut self) -> anyhow::Result<()> {
-		let (send, recv) = self.conn.accept_bi().await.context("Failed to accept bidirectional stream")?;
-		self.control = Some((send, recv));
-		Ok(())
-	}
+	async fn handshake(&mut self) -> anyhow::Result<()> {
+		ensure!(matches!(self.state, ServerState::Handshaking));
 
-	async fn handle_message(&mut self, message: ClientMessage) -> anyhow::Result<()> {
-		let state = std::mem::replace(&mut self.state, ServerState::RegisteringTransfers);
-		match (state, message) {
-			(ServerState::Handshaking, ClientMessage::Hello { version }) => {
+		match self.read_control().await? {
+			ClientMessage::Hello { version } => {
 				if version != lib::PROTOCOL_VERSION {
 					bail!("Unsupported protocol version {version}, expected {}", lib::PROTOCOL_VERSION);
 				}
 				self.state = ServerState::Idle;
-				self.write_control(ServerMessage::HelloAck { version }).await
+				self.write_control(ServerMessage::HelloAck { version }).await?;
+				Ok(())
 			}
-			(ServerState::Idle, ClientMessage::RegisterTransfers { files, chunk_size, compression }) => {
-				let (transfers, rejected) = Self::create_incoming_transfers(files, chunk_size, compression, self.root_dir.clone());
+			message => bail!("Unexpected message in handshake: {message:?}"),
+		}
+	}
+
+	async fn register_transfers(&mut self) -> anyhow::Result<()> {
+		ensure!(matches!(self.state, ServerState::Idle));
+
+		let frame = self.read_control_frame().await?;
+		let message = Self::access_message(&frame)?;
+
+		match message {
+			ArchivedClientMessage::RegisterTransfers { files, chunk_size, compression } => {
+				let (transfers, rejected) = Self::create_incoming_transfers(files.iter(), files.len(), chunk_size.to_native(), compression.into(), self.root_dir.clone());
 
 				let message = if transfers.is_empty() {
 					self.state = ServerState::Idle;
@@ -140,24 +132,72 @@ impl ServerSession {
 
 				Ok(())
 			}
-			(ServerState::ReceivingFiles { mut streams }, ClientMessage::TransferFinished) => {
-				while let Some(result) = streams.join_next().await {
-					result??;
-				}
-
-				self.state = ServerState::Idle;
-				let message = ServerMessage::TransferComplete;
-				self.write_control(message).await?;
-
-				Ok(())
-			}
-
-			(state, message) => {
-				let error = anyhow::anyhow!("Unexpected message in {state} state: {message:?}");
-				self.state = state;
-				Err(error)
-			}
+			message => bail!("Unexpected message in register transfers: {message:?}"),
 		}
+	}
+
+	async fn finish_and_reconcile(&mut self) -> anyhow::Result<()> {
+		let ServerState::ReceivingFiles { ref mut streams } = self.state else {
+			bail!("Unexpected state in finish and reconcile: {}", self.state);
+		};
+
+		while let Some(result) = streams.join_next().await {
+			result??;
+		}
+
+		match self.read_control().await? {
+			ClientMessage::TransferFinished => {}
+			message => bail!("Unexpected message in finish and reconcile: {message:?}"),
+		}
+
+		self.state = ServerState::Idle;
+		let message = ServerMessage::TransferComplete;
+		self.write_control(message).await?;
+		self.finish_control().await?;
+
+		Ok(())
+	}
+
+	#[inline]
+	fn access_message(bytes: &[u8]) -> Result<&ArchivedClientMessage, rancor::Error> {
+		rkyv::access(bytes)
+	}
+
+	async fn read_control_frame(&mut self) -> anyhow::Result<Bytes> {
+		let Some((_, ref mut recv)) = self.control else {
+			return Err(anyhow::anyhow!("No control stream available"));
+		};
+		let frame = Self::read_frame(recv, MAX_CONTROL_FRAME_SIZE).await?;
+		Ok(frame)
+	}
+
+	async fn read_control(&mut self) -> anyhow::Result<ClientMessage> {
+		let Some((_, ref mut recv)) = self.control else { bail!("Control stream not opened yet") };
+		let frame = Self::read_frame(recv, MAX_CONTROL_FRAME_SIZE).await?;
+		rkyv::from_bytes::<ClientMessage, rancor::Error>(&frame).context("Failed to deserialize control message")
+	}
+
+	async fn write_control(&mut self, message: ServerMessage) -> anyhow::Result<()> {
+		let Some((ref mut send, _)) = self.control else {
+			return Err(anyhow::anyhow!("No control stream available"));
+		};
+		let message = rkyv::to_bytes::<rancor::Error>(&message).context("Failed to serialize control message")?;
+		Self::write_frame(send, &message).await?;
+		Ok(())
+	}
+
+	async fn finish_control(&mut self) -> anyhow::Result<()> {
+		let Some((ref mut send, _)) = self.control else {
+			return Err(anyhow::anyhow!("No control stream available"));
+		};
+		send.finish().context("Failed to finish control stream")?;
+		Ok(())
+	}
+
+	async fn accept_control_stream(&mut self) -> anyhow::Result<()> {
+		let (send, recv) = self.conn.accept_bi().await.context("Failed to accept bidirectional stream")?;
+		self.control = Some((send, recv));
+		Ok(())
 	}
 
 	async fn receive_data_chunks(mut recv: RecvStream, transfers: Arc<Mutex<HashMap<u32, IncomingTransfer>>>) -> anyhow::Result<()> {
@@ -237,39 +277,48 @@ impl ServerSession {
 		Ok(())
 	}
 
-	fn create_incoming_transfers(files: Vec<FileManifestEntry>, chunk_size: u64, compression: Compression, root_dir: PathBuf) -> (HashMap<u32, IncomingTransfer>, Vec<RejectedTransfer>) {
-		let mut map = HashMap::with_capacity(files.len()); // Happy path is pre-allocated since this is what we expect to happen most of the time
-		let mut seen_ids = HashSet::with_capacity(files.len());
-		let mut seen_paths = HashSet::with_capacity(files.len());
+	fn create_incoming_transfers<'a, I, E>(files: I, files_len: usize, chunk_size: u64, compression: Compression, root_dir: PathBuf) -> (HashMap<u32, IncomingTransfer>, Vec<RejectedTransfer>)
+	where
+		I: IntoIterator<Item = &'a E>,
+		E: ManifestEntry + 'a,
+	{
+		let files = files.into_iter();
+		let mut map = HashMap::with_capacity(files_len); // Happy path is pre-allocated since this is what we expect to happen most of the time
+		let mut seen_ids = HashSet::with_capacity(files_len);
+		let mut seen_paths = HashSet::with_capacity(files_len);
 		let mut rejected = HashMap::new();
 		for entry in files {
-			if !seen_ids.insert(entry.id) {
-				rejected.insert(entry.id, RejectReason::DuplicateId);
+			if !seen_ids.insert(entry.id()) {
+				rejected.insert(entry.id(), RejectReason::DuplicateId);
 				continue;
 			}
 
-			if entry.rel_path.iter().any(Self::is_path_banned) {
-				rejected.insert(entry.id, RejectReason::InvalidPath);
-				continue;
+			for i in 0..entry.rel_path_len() {
+				if Self::is_path_banned(entry.rel_path_component(i)) {
+					rejected.insert(entry.id(), RejectReason::InvalidPath);
+					continue;
+				}
 			}
 
 			let mut path = root_dir.clone();
-			path.extend(entry.rel_path);
+			for i in 0..entry.rel_path_len() {
+				path.push(entry.rel_path_component(i));
+			}
 
 			if !seen_paths.insert(path.clone()) {
-				rejected.insert(entry.id, RejectReason::DuplicatePath);
+				rejected.insert(entry.id(), RejectReason::DuplicatePath);
 				continue;
 			}
 
 			let transfer = IncomingTransfer {
 				path,
-				file_size: entry.uncompressed_size,
+				file_size: entry.uncompressed_size(),
 				chunk_size,
 				compression,
 				file: None,
 				received: Default::default(),
 			};
-			map.insert(entry.id, transfer);
+			map.insert(entry.id(), transfer);
 		}
 		// Sanitation
 		// We want to go back and remove any transfer that were rejected for duplication, since a duplicate means it was already seen and might've been inserted to the map
@@ -281,7 +330,7 @@ impl ServerSession {
 		(map, rejected.into_iter().map(RejectedTransfer::from).collect())
 	}
 
-	fn is_path_banned(path: &String) -> bool {
+	fn is_path_banned(path: &str) -> bool {
 		path.is_empty() || path == ".." || path == "." || path.contains(['\\', '/', '\0']) || (cfg!(windows) && Self::is_path_banned_windows(path))
 	}
 
@@ -311,6 +360,7 @@ mod tests {
 	};
 
 	use bit_set::BitSet;
+	use lib::FileManifestEntry;
 
 	use super::*;
 
@@ -338,7 +388,7 @@ mod tests {
 		let root = test_dir("accepts-valid");
 		let files = vec![manifest(10, &["nested", "file.txt"], 12)];
 
-		let (transfers, rejected) = ServerSession::create_incoming_transfers(files, 4, Compression::None, root.clone());
+		let (transfers, rejected) = ServerSession::create_incoming_transfers(files.iter(), files.len(), 4, Compression::None, root.clone());
 
 		assert!(rejected.is_empty());
 		assert_eq!(transfers.len(), 1);
@@ -361,7 +411,7 @@ mod tests {
 			manifest(3, &["ok.txt"], 1),
 		];
 
-		let (transfers, rejected) = ServerSession::create_incoming_transfers(files, 4, Compression::LZ4, root.clone());
+		let (transfers, rejected) = ServerSession::create_incoming_transfers(files.iter(), files.len(), 4, Compression::LZ4, root.clone());
 
 		assert!(transfers.is_empty());
 		assert!(matches!(rejected_reason(&rejected, 1), Some(RejectReason::DuplicateId)));

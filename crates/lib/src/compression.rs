@@ -11,6 +11,15 @@ pub enum Compression {
 	LZ4,
 }
 
+impl From<&ArchivedCompression> for Compression {
+	fn from(value: &ArchivedCompression) -> Self {
+		match value {
+			ArchivedCompression::None => Compression::None,
+			ArchivedCompression::LZ4 => Compression::LZ4,
+		}
+	}
+}
+
 #[derive(Debug, Error)]
 pub enum CompressionError {
 	#[error("decompressed length mismatch: expected {expected}, got {actual}")]
