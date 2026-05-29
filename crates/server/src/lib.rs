@@ -64,6 +64,7 @@ struct IncomingTransfer {
 	path: PathBuf,
 	file_size: u64,
 	chunk_size: u64,
+	compression: lib::Compression,
 	// Lazily populated on first chunk
 	file: Option<tokio::fs::File>,
 	received: BitSet<u64>,

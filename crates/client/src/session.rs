@@ -12,13 +12,18 @@ use std::{
 	},
 };
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{
+	bail,
+	ensure,
+	Context,
+};
 use bytes::{
 	Bytes,
 	BytesMut,
 };
 use lib::{
 	ClientMessage,
+	Compression,
 	FileManifestEntry,
 	PacketHandler,
 	RejectedTransfer,
@@ -63,13 +68,14 @@ pub struct ClientSession {
 	conn: quinn::Connection,
 	control: Option<(quinn::SendStream, quinn::RecvStream)>,
 	state: ClientState,
+	compression: Compression,
 	files: HashMap<u32, TransferCandidate>,
 }
 
 impl PacketHandler for ClientSession {}
 
 impl ClientSession {
-	pub fn new(conn: quinn::Connection, files: Vec<PathBuf>, duplicate_strategy: DuplicateStrategy) -> anyhow::Result<Self> {
+	pub fn new(conn: quinn::Connection, files: Vec<PathBuf>, duplicate_strategy: DuplicateStrategy, compression: Compression) -> anyhow::Result<Self> {
 		if files.is_empty() {
 			bail!("No files selected");
 		}
@@ -78,6 +84,7 @@ impl ClientSession {
 			conn,
 			control: None,
 			state: ClientState::Connecting,
+			compression,
 			files,
 		})
 	}
@@ -114,7 +121,11 @@ impl ClientSession {
 		ensure!(matches!(self.state, ClientState::Idle));
 		self.state = ClientState::RegisteringTransfers;
 		let files = Self::build_file_manifest(&self.files);
-		let message = ClientMessage::RegisterTransfers { files, chunk_size: CHUNK_SIZE };
+		let message = ClientMessage::RegisterTransfers {
+			files,
+			chunk_size: CHUNK_SIZE,
+			compression: self.compression,
+		};
 		self.write_control(message).await?;
 		match self.read_control().await? {
 			ServerMessage::TransfersRegistered { accepted, rejected } => {
@@ -136,12 +147,13 @@ impl ClientSession {
 			senders.push(tx);
 
 			let conn = self.conn.clone();
+			let compression = self.compression;
 
 			join.spawn(async move {
 				let mut stream = conn.open_uni().await.context("Failed to open uni stream")?;
 
 				while let Some(job) = rx.recv().await {
-					let bytes = Self::read_chunk(&job).await?;
+					let bytes = compression.compress(Self::read_chunk(&job).await?);
 
 					let message = ClientMessage::Chunk {
 						file_id: job.id,

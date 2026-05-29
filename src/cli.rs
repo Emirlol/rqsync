@@ -7,7 +7,10 @@ use clap::{
 	Parser,
 	Subcommand,
 };
-use lib::DuplicateStrategy;
+use lib::{
+	Compression,
+	DuplicateStrategy,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -35,5 +38,8 @@ pub enum Commands {
 		files: Vec<PathBuf>,
 		/// How duplicate files should be handled
 		duplicate_strategy: DuplicateStrategy,
+		/// Compress chunks before sending them
+		#[arg(long, value_enum, default_value_t = Compression::None)]
+		compression: Compression,
 	},
 }

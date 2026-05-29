@@ -41,11 +41,13 @@ fn main() -> Result<()> {
 					server_addr,
 					files,
 					duplicate_strategy,
+					compression,
 				} => {
 					let config = ClientConfig {
 						server_addr,
 						files,
 						duplicate_strategy,
+						compression,
 					};
 					client::run_client(config).await
 				}

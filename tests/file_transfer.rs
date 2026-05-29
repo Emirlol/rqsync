@@ -13,7 +13,10 @@ use std::{
 };
 
 use client::ClientConfig;
-use lib::DuplicateStrategy;
+use lib::{
+	Compression,
+	DuplicateStrategy,
+};
 use server::ServerConfig;
 
 fn test_dir(name: &str) -> PathBuf {
@@ -54,12 +57,10 @@ async fn client_sends_files_to_server() {
 		server_addr: address,
 		files: vec![top_level_file, selected_dir],
 		duplicate_strategy: DuplicateStrategy::Reject,
+		compression: Compression::LZ4,
 	});
 
-	tokio::time::timeout(std::time::Duration::from_secs(10), client)
-		.await
-		.expect("client timed out")
-		.unwrap();
+	tokio::time::timeout(std::time::Duration::from_secs(10), client).await.expect("client timed out").unwrap();
 
 	server.abort();
 	let _ = server.await;

@@ -12,7 +12,10 @@ use std::{
 };
 
 use anyhow::Context;
-use lib::DuplicateStrategy;
+use lib::{
+	Compression,
+	DuplicateStrategy,
+};
 use quinn::{
 	crypto::rustls::QuicClientConfig,
 	rustls,
@@ -25,6 +28,7 @@ pub struct ClientConfig {
 	pub server_addr: SocketAddr,
 	pub files: Vec<PathBuf>,
 	pub duplicate_strategy: DuplicateStrategy,
+	pub compression: Compression,
 }
 
 pub async fn run_client(config: ClientConfig) -> anyhow::Result<()> {
@@ -32,6 +36,7 @@ pub async fn run_client(config: ClientConfig) -> anyhow::Result<()> {
 		server_addr,
 		files,
 		duplicate_strategy,
+		compression,
 	} = config;
 	let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
 	let mut endpoint = Endpoint::client(bind_addr)?;
@@ -41,7 +46,7 @@ pub async fn run_client(config: ClientConfig) -> anyhow::Result<()> {
 		.await?
 		.context("Connection timed out")?;
 
-	let mut session = ClientSession::new(conn, files, duplicate_strategy)?;
+	let mut session = ClientSession::new(conn, files, duplicate_strategy, compression)?;
 	session.run().await?;
 
 	Ok(())

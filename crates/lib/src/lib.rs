@@ -1,10 +1,16 @@
 pub mod cert;
 pub mod compression;
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::{
+	collections::HashSet,
+	time::Duration,
+};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{
+	Bytes,
+	BytesMut,
+};
+pub use compression::Compression;
 use quinn::{
 	TransportConfig,
 	VarInt,
@@ -19,11 +25,25 @@ pub const MAX_DATA_FRAME_SIZE: usize = 16 * 1024 * 1024;
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(derive(Debug))]
 pub enum ClientMessage {
-	Hello { version: u32 },
-	RegisterTransfers { files: Vec<FileManifestEntry>, chunk_size: u64 },
-	Chunk { file_id: u32, offset: u64, bytes: Bytes },
+	Hello {
+		version: u32,
+	},
+	RegisterTransfers {
+		files: Vec<FileManifestEntry>,
+		chunk_size: u64,
+		compression: Compression,
+	},
+	Chunk {
+		file_id: u32,
+		offset: u64,
+		bytes: Bytes,
+	},
 	TransferFinished,
-	ResendChunks { file_id: u32, offset: u64, bytes: Bytes },
+	ResendChunks {
+		file_id: u32,
+		offset: u64,
+		bytes: Bytes,
+	},
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
@@ -91,7 +111,7 @@ pub enum PacketError {
 	#[error("Quinn read error: {0:?}")]
 	ReadExactError(#[from] quinn::ReadExactError),
 	#[error("Quinn write error: {0:?}")]
-	WriteError(#[from] quinn::WriteError)
+	WriteError(#[from] quinn::WriteError),
 }
 
 #[async_trait::async_trait]
@@ -110,7 +130,10 @@ pub trait PacketHandler {
 	}
 
 	async fn write_frame(send: &mut quinn::SendStream, data: &[u8]) -> Result<(), PacketError> {
-		let len: u32 = data.len().try_into().map_err(|_| PacketError::FrameTooLarge { expected: u32::MAX as usize, actual: data.len() })?;
+		let len: u32 = data.len().try_into().map_err(|_| PacketError::FrameTooLarge {
+			expected: u32::MAX as usize,
+			actual: data.len(),
+		})?;
 
 		send.write_all(&len.to_be_bytes()).await.map_err(PacketError::WriteError)?;
 		send.write_all(&data).await.map_err(PacketError::WriteError)?;

@@ -16,9 +16,11 @@ use anyhow::{
 	bail,
 	Context,
 };
+use bytes::Bytes;
 use lib::{
 	ArchivedClientMessage,
 	ClientMessage,
+	Compression,
 	FileManifestEntry,
 	PacketError,
 	PacketHandler,
@@ -28,7 +30,10 @@ use lib::{
 	MAX_CONTROL_FRAME_SIZE,
 	MAX_DATA_FRAME_SIZE,
 };
-use quinn::RecvStream;
+use quinn::{
+	RecvStream,
+	SendStream,
+};
 use rkyv::rancor;
 use tokio::{
 	fs::OpenOptions,
@@ -44,7 +49,7 @@ use crate::IncomingTransfer;
 
 pub struct ServerSession {
 	conn: quinn::Connection,
-	control: Option<(quinn::SendStream, quinn::RecvStream)>,
+	control: Option<(SendStream, RecvStream)>,
 	root_dir: PathBuf,
 	state: ServerState,
 }
@@ -107,8 +112,8 @@ impl ServerSession {
 				self.state = ServerState::Idle;
 				self.write_control(ServerMessage::HelloAck { version }).await
 			}
-			(ServerState::Idle, ClientMessage::RegisterTransfers { files, chunk_size }) => {
-				let (transfers, rejected) = Self::create_incoming_transfers(files, chunk_size, self.root_dir.clone());
+			(ServerState::Idle, ClientMessage::RegisterTransfers { files, chunk_size, compression }) => {
+				let (transfers, rejected) = Self::create_incoming_transfers(files, chunk_size, compression, self.root_dir.clone());
 
 				let message = if transfers.is_empty() {
 					self.state = ServerState::Idle;
@@ -184,13 +189,8 @@ impl ServerSession {
 			bail!("Received chunk for unknown file id {file_id}");
 		};
 
-		let len = bytes.len() as u64;
-		if len > transfer.chunk_size {
-			bail!("Received chunk with length {len} that is larger than the chunk size {}", transfer.chunk_size);
-		}
-
-		if offset + len > transfer.file_size {
-			bail!("Received chunk with offset {offset} and length {len} that is past the end of the file (size {})", transfer.file_size);
+		if offset >= transfer.file_size {
+			bail!("Received chunk with offset {offset} that is past the end of the file (size {})", transfer.file_size);
 		}
 
 		let div = offset / transfer.chunk_size;
@@ -202,6 +202,18 @@ impl ServerSession {
 
 		if transfer.received.contains(div as usize) {
 			bail!("Received chunk with offset {offset} that was already received");
+		}
+
+		let expected_len = (transfer.file_size - offset).min(transfer.chunk_size) as usize;
+		let bytes = transfer.compression.decompress(Bytes::copy_from_slice(bytes), expected_len).context("Failed to decompress chunk")?;
+
+		let len = bytes.len() as u64;
+		if len > transfer.chunk_size {
+			bail!("Received chunk with length {len} that is larger than the chunk size {}", transfer.chunk_size);
+		}
+
+		if offset + len > transfer.file_size {
+			bail!("Received chunk with offset {offset} and length {len} that is past the end of the file (size {})", transfer.file_size);
 		}
 
 		if transfer.file.is_none() {
@@ -217,14 +229,15 @@ impl ServerSession {
 
 		let file = transfer.file.as_mut().unwrap();
 		file.seek(SeekFrom::Start(offset)).await?;
-		file.write_all(bytes).await?;
+		file.write_all(&bytes).await?;
+		file.flush().await?;
 
 		transfer.received.insert(div as usize);
 
 		Ok(())
 	}
 
-	fn create_incoming_transfers(files: Vec<FileManifestEntry>, chunk_size: u64, root_dir: PathBuf) -> (HashMap<u32, IncomingTransfer>, Vec<RejectedTransfer>) {
+	fn create_incoming_transfers(files: Vec<FileManifestEntry>, chunk_size: u64, compression: Compression, root_dir: PathBuf) -> (HashMap<u32, IncomingTransfer>, Vec<RejectedTransfer>) {
 		let mut map = HashMap::with_capacity(files.len()); // Happy path is pre-allocated since this is what we expect to happen most of the time
 		let mut seen_ids = HashSet::with_capacity(files.len());
 		let mut seen_paths = HashSet::with_capacity(files.len());
@@ -252,6 +265,7 @@ impl ServerSession {
 				path,
 				file_size: entry.uncompressed_size,
 				chunk_size,
+				compression,
 				file: None,
 				received: Default::default(),
 			};
@@ -324,7 +338,7 @@ mod tests {
 		let root = test_dir("accepts-valid");
 		let files = vec![manifest(10, &["nested", "file.txt"], 12)];
 
-		let (transfers, rejected) = ServerSession::create_incoming_transfers(files, 4, root.clone());
+		let (transfers, rejected) = ServerSession::create_incoming_transfers(files, 4, Compression::None, root.clone());
 
 		assert!(rejected.is_empty());
 		assert_eq!(transfers.len(), 1);
@@ -332,6 +346,7 @@ mod tests {
 		assert_eq!(transfer.path, root.join("nested").join("file.txt"));
 		assert_eq!(transfer.file_size, 12);
 		assert_eq!(transfer.chunk_size, 4);
+		assert_eq!(transfer.compression, Compression::None);
 
 		fs::remove_dir_all(root).unwrap();
 	}
@@ -346,7 +361,7 @@ mod tests {
 			manifest(3, &["ok.txt"], 1),
 		];
 
-		let (transfers, rejected) = ServerSession::create_incoming_transfers(files, 4, root.clone());
+		let (transfers, rejected) = ServerSession::create_incoming_transfers(files, 4, Compression::LZ4, root.clone());
 
 		assert!(transfers.is_empty());
 		assert!(matches!(rejected_reason(&rejected, 1), Some(RejectReason::DuplicateId)));
@@ -364,6 +379,7 @@ mod tests {
 			path: path.clone(),
 			file_size: 8,
 			chunk_size: 4,
+			compression: Compression::None,
 			file: None,
 			received: BitSet::default(),
 		};
@@ -388,6 +404,7 @@ mod tests {
 			path,
 			file_size: 8,
 			chunk_size: 4,
+			compression: Compression::None,
 			file: None,
 			received: BitSet::default(),
 		};
@@ -401,6 +418,30 @@ mod tests {
 
 		assert!(duplicate.to_string().contains("already received"));
 		assert!(misaligned.to_string().contains("not aligned"));
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn write_chunk_decompresses_lz4_before_writing() {
+		let root = test_dir("write-compressed-chunk");
+		let path = root.join("data.bin");
+		let transfer = IncomingTransfer {
+			path: path.clone(),
+			file_size: 16,
+			chunk_size: 16,
+			compression: Compression::LZ4,
+			file: None,
+			received: BitSet::default(),
+		};
+		let mut transfers = HashMap::new();
+		transfers.insert(1, transfer);
+		let transfers = Arc::new(Mutex::new(transfers));
+		let compressed = Compression::LZ4.compress(b"aaaaaaaaaaaaaaaa"[..].into());
+
+		ServerSession::write_chunk(transfers, 1, 0, &compressed).await.unwrap();
+
+		assert_eq!(fs::read(&path).unwrap(), b"aaaaaaaaaaaaaaaa");
 
 		fs::remove_dir_all(root).unwrap();
 	}
