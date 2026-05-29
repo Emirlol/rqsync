@@ -8,11 +8,11 @@ use std::{
 
 use bit_set::BitSet;
 use quinn::{
+	Endpoint,
 	rustls::pki_types::{
 		CertificateDer,
 		PrivatePkcs8KeyDer,
 	},
-	Endpoint,
 };
 use tracing::{
 	error,
@@ -62,6 +62,7 @@ fn server_network_config() -> anyhow::Result<quinn::ServerConfig> {
 
 struct IncomingTransfer {
 	path: PathBuf,
+	rel_path: Vec<String>,
 	file_size: u64,
 	chunk_size: u64,
 	compression: lib::Compression,

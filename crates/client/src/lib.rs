@@ -17,9 +17,9 @@ use lib::{
 	DuplicateStrategy,
 };
 use quinn::{
+	Endpoint,
 	crypto::rustls::QuicClientConfig,
 	rustls,
-	Endpoint,
 };
 
 use crate::session::ClientSession;

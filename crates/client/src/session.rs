@@ -21,20 +21,22 @@ use anyhow::{
 	ensure,
 	Context,
 };
+use bit_set::BitSet;
 use bytes::{
 	Bytes,
 	BytesMut,
 };
 use lib::{
+	format_bytes,
+	progress_bar,
 	ClientMessage,
 	Compression,
 	FileManifestEntry,
 	PacketHandler,
+	ReceivedChunks,
 	RejectedTransfer,
 	ServerMessage,
 	MAX_CONTROL_FRAME_SIZE,
-	format_bytes,
-	progress_bar,
 };
 use rayon::{
 	iter::ParallelIterator,
@@ -96,28 +98,30 @@ struct SendProgress {
 }
 
 impl SendProgress {
-	fn new(files: &HashMap<u32, TransferCandidate>, accepted: &HashSet<u32>) -> Self {
+	fn new(files: &HashMap<u32, TransferCandidate>, accepted: &HashSet<u32>, resumed: &HashMap<u32, BitSet<u64>>) -> Self {
 		let files = files
 			.iter()
 			.filter(|(id, _)| accepted.contains(id))
 			.map(|(&id, transfer)| {
+				let completed_bytes = resumed.get(&id).map_or(0, |chunks| ClientSession::received_bytes(chunks, transfer.uncompressed_size, CHUNK_SIZE));
 				(
 					id,
 					FileSendProgress {
 						path: transfer.rel_path.join("/"),
 						total_bytes: transfer.uncompressed_size,
-						completed_bytes: 0,
-						completed: false,
+						completed_bytes,
+						completed: completed_bytes >= transfer.uncompressed_size && transfer.uncompressed_size > 0,
 					},
 				)
 			})
 			.collect::<HashMap<_, _>>();
 		let total_bytes = files.values().map(|file| file.total_bytes).sum();
+		let completed_bytes = files.values().map(|file| file.completed_bytes).sum();
 
 		Self {
 			files,
 			total_bytes,
-			completed_bytes: 0,
+			completed_bytes,
 			next_report_percent: 5,
 		}
 	}
@@ -188,12 +192,12 @@ impl ClientSession {
 	pub async fn run(&mut self) -> anyhow::Result<()> {
 		self.open_control_stream().await?;
 		self.handshake().await?;
-		let (accepted, rejected) = self.register_transfers().await?;
+		let (accepted, rejected, received_chunks) = self.register_transfers().await?;
 		if accepted.is_empty() {
 			bail!("All files were rejected by the server: {:?}", rejected)
 		}
 		// Rejected are intentionally ignored
-		self.send_accepted_files(accepted).await?;
+		self.send_accepted_files(accepted, received_chunks).await?;
 		self.finish_and_reconcile().await?;
 		Ok(())
 	}
@@ -208,12 +212,12 @@ impl ClientSession {
 				ensure!(version == lib::PROTOCOL_VERSION);
 				self.state = ClientState::Idle;
 			}
-			message => anyhow::bail!("Unexpected message in handshake: {message:?}"),
+			message => bail!("Unexpected message in handshake: {message:?}"),
 		}
 		Ok(())
 	}
 
-	async fn register_transfers(&mut self) -> anyhow::Result<(HashSet<u32>, Vec<RejectedTransfer>)> {
+	async fn register_transfers(&mut self) -> anyhow::Result<(HashSet<u32>, Vec<RejectedTransfer>, Vec<ReceivedChunks>)> {
 		ensure!(matches!(self.state, ClientState::Idle));
 		self.state = ClientState::RegisteringTransfers;
 		let files = Self::build_file_manifest(&self.files);
@@ -224,27 +228,29 @@ impl ClientSession {
 		};
 		self.write_control(message).await?;
 		match self.read_control().await? {
-			ServerMessage::TransfersRegistered { accepted, rejected } => {
+			ServerMessage::TransfersRegistered { accepted, rejected, received_chunks } => {
 				self.state = ClientState::SendingFiles;
-				Ok((accepted, rejected))
+				Ok((accepted, rejected, received_chunks))
 			}
 			message => anyhow::bail!("Unexpected message in register transfers: {message:?}"),
 		}
 	}
 
-	async fn send_accepted_files(&mut self, accepted: HashSet<u32>) -> anyhow::Result<()> {
+	async fn send_accepted_files(&mut self, accepted: HashSet<u32>, received_chunks: Vec<ReceivedChunks>) -> anyhow::Result<()> {
 		ensure!(matches!(self.state, ClientState::SendingFiles));
 
-		let progress = Arc::new(StdMutex::new(SendProgress::new(&self.files, &accepted)));
+		let resumed = Self::received_chunks_by_file(received_chunks);
+		let progress = Arc::new(StdMutex::new(SendProgress::new(&self.files, &accepted, &resumed)));
 		let (accepted_files, total_bytes) = {
 			let progress = progress.lock().expect("send progress lock poisoned");
 			(progress.files.len(), progress.total_bytes)
 		};
+		let completed_bytes = progress.lock().expect("send progress lock poisoned").completed_bytes;
 		info!(
 			"Sending {accepted_files} files ({}) with {:?} compression {}",
 			format_bytes(total_bytes),
 			self.compression,
-			progress_bar(0, total_bytes)
+			progress_bar(completed_bytes, total_bytes)
 		);
 
 		let mut senders = Vec::new();
@@ -289,10 +295,16 @@ impl ClientSession {
 			}
 
 			let mut offset = 0;
+			let mut chunk_index = 0usize;
 
 			while offset < transfer.uncompressed_size {
 				let remaining = transfer.uncompressed_size - offset;
 				let len = remaining.min(CHUNK_SIZE);
+				if resumed.get(&file_id).is_some_and(|chunks| chunks.contains(chunk_index)) {
+					offset += len;
+					chunk_index += 1;
+					continue;
+				}
 
 				let job = ChunkJob {
 					id: file_id,
@@ -304,6 +316,7 @@ impl ClientSession {
 				senders[next_stream].send(job).await.context("Failed to send chunk job")?;
 				next_stream = (next_stream + 1) % DATA_STREAM_COUNT; // Rounrd robin
 				offset += len;
+				chunk_index += 1;
 			}
 		}
 
@@ -351,6 +364,31 @@ impl ClientSession {
 		let (send, recv) = self.conn.open_bi().await.context("Failed to open bidirectional stream")?;
 		self.control = Some((send, recv));
 		Ok(())
+	}
+
+	fn received_bytes(received: &BitSet<u64>, file_size: u64, chunk_size: u64) -> u64 {
+		received
+			.iter()
+			.map(|chunk| {
+				let offset = chunk as u64 * chunk_size;
+				(file_size - offset).min(chunk_size)
+			})
+			.sum::<u64>()
+			.min(file_size)
+	}
+
+	fn bitset_from_received_chunks(received_chunks: &ReceivedChunks) -> BitSet<u64> {
+		let restored = BitSet::<u64>::from_bytes_general(&received_chunks.bitset_bytes);
+		let mut received = BitSet::<u64>::default();
+		received.reserve_len(received_chunks.chunk_count as usize);
+		for chunk in restored.iter().filter(|&chunk| (chunk as u64) < received_chunks.chunk_count) {
+			received.insert(chunk);
+		}
+		received
+	}
+
+	fn received_chunks_by_file(received_chunks: Vec<ReceivedChunks>) -> HashMap<u32, BitSet<u64>> {
+		received_chunks.into_iter().map(|chunks| (chunks.file_id, Self::bitset_from_received_chunks(&chunks))).collect()
 	}
 
 	async fn read_chunk(job: &ChunkJob) -> anyhow::Result<Bytes> {

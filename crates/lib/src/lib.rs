@@ -17,7 +17,7 @@ use quinn::{
 };
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DATA_STREAM_COUNT: usize = 8;
 pub const MAX_CONTROL_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_DATA_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -49,9 +49,17 @@ pub enum ClientMessage {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(derive(Debug))]
 pub enum ServerMessage {
-	HelloAck { version: u32 },
-	AllTransfersRejected { rejected: Vec<RejectedTransfer> },
-	TransfersRegistered { accepted: HashSet<u32>, rejected: Vec<RejectedTransfer> },
+	HelloAck {
+		version: u32,
+	},
+	AllTransfersRejected {
+		rejected: Vec<RejectedTransfer>,
+	},
+	TransfersRegistered {
+		accepted: HashSet<u32>,
+		rejected: Vec<RejectedTransfer>,
+		received_chunks: Vec<ReceivedChunks>,
+	},
 	TransferComplete,
 }
 
@@ -62,6 +70,14 @@ pub struct FileManifestEntry {
 	pub uncompressed_size: u64,
 	// Last entry is the file name with extension included
 	pub rel_path: Vec<String>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+#[rkyv(derive(Debug))]
+pub struct ReceivedChunks {
+	pub file_id: u32,
+	pub chunk_count: u64,
+	pub bitset_bytes: Vec<u8>,
 }
 
 pub trait ManifestEntry {
@@ -180,11 +196,7 @@ pub fn progress_bar(completed: u64, total: u64) -> String {
 	} else {
 		((completed.min(total) as u128 * WIDTH as u128) / total as u128) as usize
 	};
-	let percent = if total == 0 {
-		100.0
-	} else {
-		(completed.min(total) as f64 / total as f64) * 100.0
-	};
+	let percent = if total == 0 { 100.0 } else { (completed.min(total) as f64 / total as f64) * 100.0 };
 
 	format!("[{}{}] {:>6.2}%", "#".repeat(filled), "-".repeat(WIDTH - filled), percent)
 }

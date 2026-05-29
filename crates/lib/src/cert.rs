@@ -3,6 +3,8 @@ use std::sync::Arc;
 use quinn::{
 	rustls,
 	rustls::{
+		DigitallySignedStruct,
+		SignatureScheme,
 		client::danger::{
 			HandshakeSignatureValid,
 			ServerCertVerified,
@@ -14,8 +16,6 @@ use quinn::{
 			ServerName,
 			UnixTime,
 		},
-		DigitallySignedStruct,
-		SignatureScheme,
 	},
 };
 

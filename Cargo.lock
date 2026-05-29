@@ -252,6 +252,7 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bit-set",
  "bytes",
  "lib",
  "quinn",
@@ -1222,6 +1223,8 @@ dependencies = [
  "clap",
  "client",
  "lib",
+ "quinn",
+ "rkyv",
  "server",
  "tokio",
  "tracing",

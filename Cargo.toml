@@ -33,8 +33,6 @@ client = { path = "crates/client" }
 server = { path = "crates/server" }
 lib = { path = "crates/lib" }
 
-
-
 [package]
 name = "speedtest"
 version = "0.1.0"
@@ -50,3 +48,7 @@ tracing-subscriber.workspace = true
 client.workspace = true
 server.workspace = true
 lib.workspace = true
+
+[dev-dependencies]
+quinn.workspace = true
+rkyv.workspace = true
