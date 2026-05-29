@@ -13,10 +13,6 @@ use std::{
 		Arc,
 		Mutex as StdMutex,
 	},
-	time::{
-		Duration,
-		Instant,
-	},
 };
 
 use anyhow::{
@@ -66,8 +62,6 @@ use crate::IncomingTransfer;
 const RESUME_METADATA_FILE: &str = ".speedtest-resume.rkyv";
 const RESUME_METADATA_TEMP_FILE: &str = ".speedtest-resume.rkyv.tmp";
 const RESUME_METADATA_VERSION: u32 = 1;
-const RESUME_CHECKPOINT_MIN_BYTES: u64 = 256 * 1024 * 1024;
-const RESUME_CHECKPOINT_MIN_ELAPSED: Duration = Duration::from_secs(5);
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(derive(Debug))]
@@ -103,52 +97,21 @@ struct ReceiveProgress {
 
 pub struct ReceiveState {
 	transfers: HashMap<u32, IncomingTransfer>,
-	checkpoint: ResumeCheckpoint,
+	resume_path: PathBuf,
+	dirty: bool,
 }
 
 impl ReceiveState {
 	fn new(transfers: HashMap<u32, IncomingTransfer>, resume_path: PathBuf) -> Self {
 		Self {
 			transfers,
-			checkpoint: ResumeCheckpoint::new(resume_path),
-		}
-	}
-}
-
-struct ResumeCheckpoint {
-	path: PathBuf,
-	bytes_since_checkpoint: u64,
-	last_checkpoint: Instant,
-	dirty_file_ids: HashSet<u32>,
-	min_bytes: u64,
-	min_elapsed: Duration,
-}
-
-impl ResumeCheckpoint {
-	fn new(path: PathBuf) -> Self {
-		Self {
-			path,
-			bytes_since_checkpoint: 0,
-			last_checkpoint: Instant::now(),
-			dirty_file_ids: HashSet::new(),
-			min_bytes: RESUME_CHECKPOINT_MIN_BYTES,
-			min_elapsed: RESUME_CHECKPOINT_MIN_ELAPSED,
+			resume_path,
+			dirty: false,
 		}
 	}
 
-	fn record_written(&mut self, file_id: u32, bytes: u64) {
-		self.dirty_file_ids.insert(file_id);
-		self.bytes_since_checkpoint += bytes;
-	}
-
-	fn should_checkpoint(&self) -> bool {
-		!self.dirty_file_ids.is_empty() && (self.bytes_since_checkpoint >= self.min_bytes || self.last_checkpoint.elapsed() >= self.min_elapsed)
-	}
-
-	fn reset(&mut self) {
-		self.bytes_since_checkpoint = 0;
-		self.last_checkpoint = Instant::now();
-		self.dirty_file_ids.clear();
+	fn mark_dirty(&mut self) {
+		self.dirty = true;
 	}
 }
 
@@ -263,7 +226,6 @@ impl ServerSession {
 						Compression::from(compression),
 						progress_bar(completed_bytes, total_bytes)
 					);
-					Self::persist_resume_metadata(&resume_path, &transfers).await?;
 					let receive_state = Arc::new(Mutex::new(ReceiveState::new(transfers, resume_path)));
 					let mut streams = JoinSet::new();
 					for _ in 0..lib::DATA_STREAM_COUNT {
@@ -296,18 +258,27 @@ impl ServerSession {
 			};
 
 			while let Some(result) = streams.join_next().await {
-				result??;
+				if let Err(err) = result? {
+					Self::persist_resume_metadata_on_disconnect(receive_state).await?;
+					return Err(err);
+				}
 			}
 
 			receive_state.clone()
 		};
 
-		match self.read_control().await? {
-			ClientMessage::TransferFinished => {}
-			message => bail!("Unexpected message in finish and reconcile: {message:?}"),
+		match self.read_control().await {
+			Ok(ClientMessage::TransferFinished) => {}
+			Ok(message) => {
+				Self::persist_resume_metadata_on_disconnect(&receive_state).await?;
+				bail!("Unexpected message in finish and reconcile: {message:?}");
+			}
+			Err(err) => {
+				Self::persist_resume_metadata_on_disconnect(&receive_state).await?;
+				return Err(err);
+			}
 		}
 
-		Self::checkpoint_resume_metadata(&receive_state, true).await?;
 		self.state = ServerState::Idle;
 		let message = ServerMessage::TransferComplete;
 		self.write_control(message).await?;
@@ -435,47 +406,34 @@ impl ServerSession {
 		transfer.received.insert(div as usize);
 		transfer.received_bytes += len;
 		let wrote_file = if !transfer.completed && transfer.received_bytes >= transfer.file_size {
-			transfer.file.as_mut().unwrap().sync_all().await?;
 			transfer.completed = true;
 			Some((transfer.path.clone(), transfer.file_size))
 		} else {
 			None
 		};
-		state.checkpoint.record_written(file_id, len);
+		state.mark_dirty();
 
 		if let Some((path, file_size)) = wrote_file {
 			info!("Wrote file {} ({})", path.display(), format_bytes(file_size));
 		}
 		drop(state);
-		Self::checkpoint_resume_metadata(&receive_state, false).await?;
 		record_written(&progress, len);
 
 		Ok(())
 	}
 
-	async fn checkpoint_resume_metadata(receive_state: &Arc<Mutex<ReceiveState>>, force: bool) -> anyhow::Result<()> {
+	async fn persist_resume_metadata_on_disconnect(receive_state: &Arc<Mutex<ReceiveState>>) -> anyhow::Result<()> {
 		let mut receive_state = receive_state.lock().await;
-		if !force && !receive_state.checkpoint.should_checkpoint() {
+		if !receive_state.dirty {
 			return Ok(());
 		}
 
-		if receive_state.checkpoint.dirty_file_ids.is_empty() {
-			if force {
-				Self::persist_resume_metadata(&receive_state.checkpoint.path, &receive_state.transfers).await?;
-				receive_state.checkpoint.reset();
-			}
-			return Ok(());
-		}
+		let path = receive_state.resume_path.clone();
+		let metadata = Self::metadata_from_transfers(&receive_state.transfers);
+		receive_state.dirty = false;
+		drop(receive_state);
 
-		let dirty_file_ids = receive_state.checkpoint.dirty_file_ids.iter().copied().collect::<Vec<_>>();
-		for file_id in dirty_file_ids {
-			if let Some(file) = receive_state.transfers.get_mut(&file_id).and_then(|transfer| transfer.file.as_mut()) {
-				file.sync_all().await?;
-			}
-		}
-
-		Self::persist_resume_metadata(&receive_state.checkpoint.path, &receive_state.transfers).await?;
-		receive_state.checkpoint.reset();
+		Self::persist_resume_metadata_data(&path, metadata).await?;
 		Ok(())
 	}
 
@@ -577,8 +535,7 @@ impl ServerSession {
 		Ok(received_chunks)
 	}
 
-	async fn persist_resume_metadata(path: &std::path::Path, transfers: &HashMap<u32, IncomingTransfer>) -> anyhow::Result<()> {
-		let metadata = Self::metadata_from_transfers(transfers);
+	async fn persist_resume_metadata_data(path: &std::path::Path, metadata: ResumeMetadata) -> anyhow::Result<()> {
 		let bytes = rkyv::to_bytes::<rancor::Error>(&metadata).context("Failed to serialize resume metadata")?;
 		let temp_path = path.with_file_name(RESUME_METADATA_TEMP_FILE);
 		fs::write(&temp_path, &bytes).await.context("Failed to write resume metadata")?;
@@ -898,7 +855,7 @@ mod tests {
 		let progress = receive_progress(8);
 
 		ServerSession::write_chunk(receive_state.clone(), progress, 1, 4, b"test").await.unwrap();
-		ServerSession::checkpoint_resume_metadata(&receive_state, true).await.unwrap();
+		ServerSession::persist_resume_metadata_on_disconnect(&receive_state).await.unwrap();
 
 		assert_eq!(fs::read(&path).unwrap(), b"\0\0\0\0test");
 		assert!(receive_state.lock().await.transfers.get(&1).unwrap().received.contains(1));
@@ -907,8 +864,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn write_chunk_does_not_checkpoint_before_thresholds() {
-		let root = test_dir("checkpoint-waits");
+	async fn write_chunk_does_not_write_resume_metadata_until_disconnect() {
+		let root = test_dir("metadata-waits");
 		let path = root.join("data.bin");
 		let transfer = IncomingTransfer {
 			path,
@@ -935,8 +892,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn forced_checkpoint_persists_metadata_and_clears_dirty_state() {
-		let root = test_dir("checkpoint-force");
+	async fn disconnect_persists_metadata_and_clears_dirty_state() {
+		let root = test_dir("metadata-disconnect");
 		let path = root.join("data.bin");
 		let transfer = IncomingTransfer {
 			path,
@@ -956,20 +913,19 @@ mod tests {
 		let progress = receive_progress(8);
 
 		ServerSession::write_chunk(receive_state.clone(), progress, 1, 0, b"test").await.unwrap();
-		ServerSession::checkpoint_resume_metadata(&receive_state, true).await.unwrap();
+		ServerSession::persist_resume_metadata_on_disconnect(&receive_state).await.unwrap();
 
 		let metadata = ServerSession::load_resume_metadata(&resume_path).await.unwrap().unwrap();
 		let received = ServerSession::bitset_from_bytes(&metadata.files[0].bitset_bytes, 2);
 		assert!(received.contains(0));
 		let state = receive_state.lock().await;
-		assert_eq!(state.checkpoint.bytes_since_checkpoint, 0);
-		assert!(state.checkpoint.dirty_file_ids.is_empty());
+		assert!(!state.dirty);
 
 		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
-	async fn completed_file_is_synced_marked_complete_and_readable() {
+	async fn completed_file_is_marked_complete_and_readable() {
 		let root = test_dir("complete-file");
 		let path = root.join("data.bin");
 		let transfer = IncomingTransfer {
