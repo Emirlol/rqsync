@@ -27,6 +27,8 @@ use crate::cli::{
 /// - Continue building the metadata file as more files are received, and also continue receiving files in general lol
 
 fn main() -> Result<()> {
+	tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+
 	let cli = Cli::parse();
 	let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 	rt.block_on(async {

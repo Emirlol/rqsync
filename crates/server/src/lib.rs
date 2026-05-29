@@ -65,6 +65,8 @@ struct IncomingTransfer {
 	file_size: u64,
 	chunk_size: u64,
 	compression: lib::Compression,
+	received_bytes: u64,
+	completed: bool,
 	// Lazily populated on first chunk
 	file: Option<tokio::fs::File>,
 	received: BitSet<u64>,

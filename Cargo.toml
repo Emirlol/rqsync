@@ -44,6 +44,8 @@ edition = "2024"
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 client.workspace = true
 server.workspace = true

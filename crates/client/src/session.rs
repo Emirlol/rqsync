@@ -10,6 +10,10 @@ use std::{
 		Path,
 		PathBuf,
 	},
+	sync::{
+		Arc,
+		Mutex as StdMutex,
+	},
 };
 
 use anyhow::{
@@ -29,6 +33,8 @@ use lib::{
 	RejectedTransfer,
 	ServerMessage,
 	MAX_CONTROL_FRAME_SIZE,
+	format_bytes,
+	progress_bar,
 };
 use rayon::{
 	iter::ParallelIterator,
@@ -44,6 +50,7 @@ use tokio::{
 	sync::mpsc,
 	task::JoinSet,
 };
+use tracing::info;
 use walkdir::WalkDir;
 
 use crate::{
@@ -73,6 +80,95 @@ pub struct ClientSession {
 }
 
 impl PacketHandler for ClientSession {}
+
+struct FileSendProgress {
+	path: String,
+	total_bytes: u64,
+	completed_bytes: u64,
+	completed: bool,
+}
+
+struct SendProgress {
+	files: HashMap<u32, FileSendProgress>,
+	total_bytes: u64,
+	completed_bytes: u64,
+	next_report_percent: u64,
+}
+
+impl SendProgress {
+	fn new(files: &HashMap<u32, TransferCandidate>, accepted: &HashSet<u32>) -> Self {
+		let files = files
+			.iter()
+			.filter(|(id, _)| accepted.contains(id))
+			.map(|(&id, transfer)| {
+				(
+					id,
+					FileSendProgress {
+						path: transfer.rel_path.join("/"),
+						total_bytes: transfer.uncompressed_size,
+						completed_bytes: 0,
+						completed: false,
+					},
+				)
+			})
+			.collect::<HashMap<_, _>>();
+		let total_bytes = files.values().map(|file| file.total_bytes).sum();
+
+		Self {
+			files,
+			total_bytes,
+			completed_bytes: 0,
+			next_report_percent: 5,
+		}
+	}
+
+	fn record_sent(&mut self, file_id: u32, bytes: u64) -> Vec<String> {
+		let Some(file) = self.files.get_mut(&file_id) else {
+			return Vec::new();
+		};
+
+		let remaining = file.total_bytes.saturating_sub(file.completed_bytes);
+		let bytes = bytes.min(remaining);
+		file.completed_bytes += bytes;
+		self.completed_bytes += bytes;
+
+		let mut messages = Vec::new();
+		if !file.completed && file.completed_bytes >= file.total_bytes {
+			file.completed = true;
+			messages.push(format!("Sent file {} ({})", file.path, format_bytes(file.total_bytes)));
+		}
+
+		let percent = self.percent_complete();
+		if percent >= self.next_report_percent || self.completed_bytes >= self.total_bytes {
+			messages.push(format!(
+				"Send progress {} {}/{}",
+				progress_bar(self.completed_bytes, self.total_bytes),
+				format_bytes(self.completed_bytes),
+				format_bytes(self.total_bytes)
+			));
+			while self.next_report_percent <= percent {
+				self.next_report_percent += 5;
+			}
+		}
+
+		messages
+	}
+
+	fn percent_complete(&self) -> u64 {
+		if self.total_bytes == 0 {
+			100
+		} else {
+			(self.completed_bytes.min(self.total_bytes) * 100) / self.total_bytes
+		}
+	}
+}
+
+fn record_sent(progress: &Arc<StdMutex<SendProgress>>, file_id: u32, bytes: u64) {
+	let messages = progress.lock().expect("send progress lock poisoned").record_sent(file_id, bytes);
+	for message in messages {
+		info!("{message}");
+	}
+}
 
 impl ClientSession {
 	pub fn new(conn: quinn::Connection, files: Vec<PathBuf>, duplicate_strategy: DuplicateStrategy, compression: Compression) -> anyhow::Result<Self> {
@@ -139,6 +235,18 @@ impl ClientSession {
 	async fn send_accepted_files(&mut self, accepted: HashSet<u32>) -> anyhow::Result<()> {
 		ensure!(matches!(self.state, ClientState::SendingFiles));
 
+		let progress = Arc::new(StdMutex::new(SendProgress::new(&self.files, &accepted)));
+		let (accepted_files, total_bytes) = {
+			let progress = progress.lock().expect("send progress lock poisoned");
+			(progress.files.len(), progress.total_bytes)
+		};
+		info!(
+			"Sending {accepted_files} files ({}) with {:?} compression {}",
+			format_bytes(total_bytes),
+			self.compression,
+			progress_bar(0, total_bytes)
+		);
+
 		let mut senders = Vec::new();
 		let mut join: JoinSet<anyhow::Result<_>> = JoinSet::new();
 
@@ -148,6 +256,7 @@ impl ClientSession {
 
 			let conn = self.conn.clone();
 			let compression = self.compression;
+			let progress = progress.clone();
 
 			join.spawn(async move {
 				let mut stream = conn.open_uni().await.context("Failed to open uni stream")?;
@@ -163,6 +272,7 @@ impl ClientSession {
 
 					let encoded = rkyv::to_bytes::<rancor::Error>(&message).context("Failed to serialize chunk message")?;
 					Self::write_frame(&mut stream, &encoded).await.context("Failed to write chunk message")?;
+					record_sent(&progress, job.id, job.uncompressed_len);
 				}
 
 				stream.finish().context("Failed to finish data stream")?;

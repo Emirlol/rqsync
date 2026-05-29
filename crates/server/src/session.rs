@@ -9,7 +9,10 @@ use std::{
 	},
 	io::SeekFrom,
 	path::PathBuf,
-	sync::Arc,
+	sync::{
+		Arc,
+		Mutex as StdMutex,
+	},
 };
 
 use anyhow::{
@@ -19,6 +22,8 @@ use anyhow::{
 };
 use bytes::Bytes;
 use lib::{
+	format_bytes,
+	progress_bar,
 	ArchivedClientMessage,
 	ClientMessage,
 	Compression,
@@ -45,6 +50,7 @@ use tokio::{
 	sync::Mutex,
 	task::JoinSet,
 };
+use tracing::info;
 
 use crate::IncomingTransfer;
 
@@ -56,6 +62,55 @@ pub struct ServerSession {
 }
 
 impl PacketHandler for ServerSession {}
+
+struct ReceiveProgress {
+	total_bytes: u64,
+	completed_bytes: u64,
+	next_report_percent: u64,
+}
+
+impl ReceiveProgress {
+	fn new(transfers: &HashMap<u32, IncomingTransfer>) -> Self {
+		Self {
+			total_bytes: transfers.values().map(|transfer| transfer.file_size).sum(),
+			completed_bytes: 0,
+			next_report_percent: 5,
+		}
+	}
+
+	fn record_written(&mut self, bytes: u64) -> Option<String> {
+		self.completed_bytes = (self.completed_bytes + bytes).min(self.total_bytes);
+		let percent = self.percent_complete();
+		if percent >= self.next_report_percent || self.completed_bytes >= self.total_bytes {
+			while self.next_report_percent <= percent {
+				self.next_report_percent += 5;
+			}
+			Some(format!(
+				"Receive progress {} {}/{}",
+				progress_bar(self.completed_bytes, self.total_bytes),
+				format_bytes(self.completed_bytes),
+				format_bytes(self.total_bytes)
+			))
+		} else {
+			None
+		}
+	}
+
+	fn percent_complete(&self) -> u64 {
+		if self.total_bytes == 0 {
+			100
+		} else {
+			(self.completed_bytes.min(self.total_bytes) * 100) / self.total_bytes
+		}
+	}
+}
+
+fn record_written(progress: &Arc<StdMutex<ReceiveProgress>>, bytes: u64) {
+	let message = progress.lock().expect("receive progress lock poisoned").record_written(bytes);
+	if let Some(message) = message {
+		info!("{message}");
+	}
+}
 
 impl ServerSession {
 	pub fn new(conn: quinn::Connection, root_dir: PathBuf) -> Self {
@@ -105,22 +160,32 @@ impl ServerSession {
 
 		match message {
 			ArchivedClientMessage::RegisterTransfers { files, chunk_size, compression } => {
-				let (transfers, rejected) = Self::create_incoming_transfers(files.iter(), files.len(), chunk_size.to_native(), compression.into(), self.root_dir.clone());
+				let (transfers, rejected) = Self::create_incoming_transfers(files.iter(), chunk_size.to_native(), compression.into(), self.root_dir.clone());
 
 				let message = if transfers.is_empty() {
 					self.state = ServerState::Idle;
 					ServerMessage::AllTransfersRejected { rejected }
 				} else {
 					let accepted = transfers.keys().copied().collect::<HashSet<_>>();
+					let receive_progress = Arc::new(StdMutex::new(ReceiveProgress::new(&transfers)));
+					let total_bytes = receive_progress.lock().expect("receive progress lock poisoned").total_bytes;
+					info!(
+						"Receiving {} files ({}) with {:?} compression {}",
+						transfers.len(),
+						format_bytes(total_bytes),
+						Compression::from(compression),
+						progress_bar(0, total_bytes)
+					);
 					let transfers = Arc::new(Mutex::new(transfers));
 					let mut streams = JoinSet::new();
 					for _ in 0..lib::DATA_STREAM_COUNT {
 						let conn = self.conn.clone();
 						let transfers = transfers.clone();
+						let receive_progress = receive_progress.clone();
 
 						streams.spawn(async move {
 							let recv = conn.accept_uni().await.context("Failed to accept uni stream")?;
-							Self::receive_data_chunks(recv, transfers).await
+							Self::receive_data_chunks(recv, transfers, receive_progress).await
 						});
 					}
 
@@ -200,7 +265,7 @@ impl ServerSession {
 		Ok(())
 	}
 
-	async fn receive_data_chunks(mut recv: RecvStream, transfers: Arc<Mutex<HashMap<u32, IncomingTransfer>>>) -> anyhow::Result<()> {
+	async fn receive_data_chunks(mut recv: RecvStream, transfers: Arc<Mutex<HashMap<u32, IncomingTransfer>>>, progress: Arc<StdMutex<ReceiveProgress>>) -> anyhow::Result<()> {
 		loop {
 			let frame = match Self::read_frame(&mut recv, MAX_DATA_FRAME_SIZE).await {
 				Ok(frame) => frame,
@@ -216,14 +281,14 @@ impl ServerSession {
 
 			match message {
 				ArchivedClientMessage::Chunk { file_id, offset, bytes } => {
-					Self::write_chunk(transfers.clone(), file_id.to_native(), offset.to_native(), bytes).await?;
+					Self::write_chunk(transfers.clone(), progress.clone(), file_id.to_native(), offset.to_native(), bytes).await?;
 				}
 				message => bail!("Unexpected message in data stream: {message:?}"),
 			}
 		}
 	}
 
-	async fn write_chunk(transfers: Arc<Mutex<HashMap<u32, IncomingTransfer>>>, file_id: u32, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
+	async fn write_chunk(transfers: Arc<Mutex<HashMap<u32, IncomingTransfer>>>, progress: Arc<StdMutex<ReceiveProgress>>, file_id: u32, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
 		let mut transfers = transfers.lock().await;
 		let Some(transfer) = transfers.get_mut(&file_id) else {
 			bail!("Received chunk for unknown file id {file_id}");
@@ -273,19 +338,26 @@ impl ServerSession {
 		file.flush().await?;
 
 		transfer.received.insert(div as usize);
+		transfer.received_bytes += len;
+
+		if !transfer.completed && transfer.received_bytes >= transfer.file_size {
+			transfer.completed = true;
+			info!("Wrote file {} ({})", transfer.path.display(), format_bytes(transfer.file_size));
+		}
+		record_written(&progress, len);
 
 		Ok(())
 	}
 
-	fn create_incoming_transfers<'a, I, E>(files: I, files_len: usize, chunk_size: u64, compression: Compression, root_dir: PathBuf) -> (HashMap<u32, IncomingTransfer>, Vec<RejectedTransfer>)
+	fn create_incoming_transfers<'a, I, E>(files: I, chunk_size: u64, compression: Compression, root_dir: PathBuf) -> (HashMap<u32, IncomingTransfer>, Vec<RejectedTransfer>)
 	where
-		I: IntoIterator<Item = &'a E>,
+		I: ExactSizeIterator<Item = &'a E>,
 		E: ManifestEntry + 'a,
 	{
 		let files = files.into_iter();
-		let mut map = HashMap::with_capacity(files_len); // Happy path is pre-allocated since this is what we expect to happen most of the time
-		let mut seen_ids = HashSet::with_capacity(files_len);
-		let mut seen_paths = HashSet::with_capacity(files_len);
+		let mut map = HashMap::with_capacity(files.len()); // Happy path is pre-allocated since this is what we expect to happen most of the time
+		let mut seen_ids = HashSet::with_capacity(files.len());
+		let mut seen_paths = HashSet::with_capacity(files.len());
 		let mut rejected = HashMap::new();
 		for entry in files {
 			if !seen_ids.insert(entry.id()) {
@@ -315,6 +387,8 @@ impl ServerSession {
 				file_size: entry.uncompressed_size(),
 				chunk_size,
 				compression,
+				received_bytes: 0,
+				completed: false,
 				file: None,
 				received: Default::default(),
 			};
@@ -383,12 +457,20 @@ mod tests {
 		rejected.iter().find(|entry| entry.id == id).map(|entry| entry.reason.clone())
 	}
 
+	fn receive_progress(total_bytes: u64) -> Arc<StdMutex<ReceiveProgress>> {
+		Arc::new(StdMutex::new(ReceiveProgress {
+			total_bytes,
+			completed_bytes: 0,
+			next_report_percent: 5,
+		}))
+	}
+
 	#[test]
 	fn create_incoming_transfers_accepts_valid_manifest_entries() {
 		let root = test_dir("accepts-valid");
 		let files = vec![manifest(10, &["nested", "file.txt"], 12)];
 
-		let (transfers, rejected) = ServerSession::create_incoming_transfers(files.iter(), files.len(), 4, Compression::None, root.clone());
+		let (transfers, rejected) = ServerSession::create_incoming_transfers(files.iter(), 4, Compression::None, root.clone());
 
 		assert!(rejected.is_empty());
 		assert_eq!(transfers.len(), 1);
@@ -411,7 +493,7 @@ mod tests {
 			manifest(3, &["ok.txt"], 1),
 		];
 
-		let (transfers, rejected) = ServerSession::create_incoming_transfers(files.iter(), files.len(), 4, Compression::LZ4, root.clone());
+		let (transfers, rejected) = ServerSession::create_incoming_transfers(files.iter(), 4, Compression::LZ4, root.clone());
 
 		assert!(transfers.is_empty());
 		assert!(matches!(rejected_reason(&rejected, 1), Some(RejectReason::DuplicateId)));
@@ -430,6 +512,8 @@ mod tests {
 			file_size: 8,
 			chunk_size: 4,
 			compression: Compression::None,
+			received_bytes: 0,
+			completed: false,
 			file: None,
 			received: BitSet::default(),
 		};
@@ -437,8 +521,9 @@ mod tests {
 		let mut transfers = HashMap::new();
 		transfers.insert(1, transfer);
 		let transfers = Arc::new(Mutex::new(transfers));
+		let progress = receive_progress(8);
 
-		ServerSession::write_chunk(transfers.clone(), 1, 4, b"test").await.unwrap();
+		ServerSession::write_chunk(transfers.clone(), progress, 1, 4, b"test").await.unwrap();
 
 		assert_eq!(fs::read(&path).unwrap(), b"\0\0\0\0test");
 		assert!(transfers.lock().await.get(&1).unwrap().received.contains(1));
@@ -455,16 +540,19 @@ mod tests {
 			file_size: 8,
 			chunk_size: 4,
 			compression: Compression::None,
+			received_bytes: 0,
+			completed: false,
 			file: None,
 			received: BitSet::default(),
 		};
 		let mut transfers = HashMap::new();
 		transfers.insert(1, transfer);
 		let transfers = Arc::new(Mutex::new(transfers));
+		let progress = receive_progress(8);
 
-		ServerSession::write_chunk(transfers.clone(), 1, 0, b"abcd").await.unwrap();
-		let duplicate = ServerSession::write_chunk(transfers.clone(), 1, 0, b"abcd").await.unwrap_err();
-		let misaligned = ServerSession::write_chunk(transfers, 1, 2, b"ab").await.unwrap_err();
+		ServerSession::write_chunk(transfers.clone(), progress.clone(), 1, 0, b"abcd").await.unwrap();
+		let duplicate = ServerSession::write_chunk(transfers.clone(), progress.clone(), 1, 0, b"abcd").await.unwrap_err();
+		let misaligned = ServerSession::write_chunk(transfers, progress, 1, 2, b"ab").await.unwrap_err();
 
 		assert!(duplicate.to_string().contains("already received"));
 		assert!(misaligned.to_string().contains("not aligned"));
@@ -481,15 +569,18 @@ mod tests {
 			file_size: 16,
 			chunk_size: 16,
 			compression: Compression::LZ4,
+			received_bytes: 0,
+			completed: false,
 			file: None,
 			received: BitSet::default(),
 		};
 		let mut transfers = HashMap::new();
 		transfers.insert(1, transfer);
 		let transfers = Arc::new(Mutex::new(transfers));
+		let progress = receive_progress(16);
 		let compressed = Compression::LZ4.compress(b"aaaaaaaaaaaaaaaa"[..].into());
 
-		ServerSession::write_chunk(transfers, 1, 0, &compressed).await.unwrap();
+		ServerSession::write_chunk(transfers, progress, 1, 0, &compressed).await.unwrap();
 
 		assert_eq!(fs::read(&path).unwrap(), b"aaaaaaaaaaaaaaaa");
 

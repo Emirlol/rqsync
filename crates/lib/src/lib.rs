@@ -155,6 +155,40 @@ pub fn transport_config() -> TransportConfig {
 	transport
 }
 
+pub fn format_bytes(bytes: u64) -> String {
+	const KIB: f64 = 1024.0;
+	const MIB: f64 = KIB * 1024.0;
+	const GIB: f64 = MIB * 1024.0;
+
+	let bytes = bytes as f64;
+	if bytes >= GIB {
+		format!("{:.2} GiB", bytes / GIB)
+	} else if bytes >= MIB {
+		format!("{:.2} MiB", bytes / MIB)
+	} else if bytes >= KIB {
+		format!("{:.2} KiB", bytes / KIB)
+	} else {
+		format!("{bytes:.0} B")
+	}
+}
+
+pub fn progress_bar(completed: u64, total: u64) -> String {
+	const WIDTH: usize = 24;
+
+	let filled = if total == 0 {
+		WIDTH
+	} else {
+		((completed.min(total) as u128 * WIDTH as u128) / total as u128) as usize
+	};
+	let percent = if total == 0 {
+		100.0
+	} else {
+		(completed.min(total) as f64 / total as f64) * 100.0
+	};
+
+	format!("[{}{}] {:>6.2}%", "#".repeat(filled), "-".repeat(WIDTH - filled), percent)
+}
+
 #[derive(Debug, Error)]
 pub enum PacketError {
 	#[error("Packet too large: expected {expected} bytes, got {actual}")]
