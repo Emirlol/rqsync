@@ -1,6 +1,8 @@
 /*
 !/src
+!/tests
 !/Cargo.lock
 !/Cargo.toml
 !/.gitignore
 !/rustfmt.toml
+!/crates

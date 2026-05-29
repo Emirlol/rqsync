@@ -1,0 +1,13 @@
+[package]
+name = "lib"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+rkyv.workspace = true
+quinn.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+clap.workspace = true

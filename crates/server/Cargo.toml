@@ -1,0 +1,16 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+tokio.workspace = true
+bit-set.workspace = true
+lib.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+rkyv.workspace = true
+lz4_flex.workspace = true
