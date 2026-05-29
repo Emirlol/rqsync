@@ -1,6 +1,9 @@
 use std::{
-	io::SeekFrom,
 	path::PathBuf,
+};
+#[cfg(test)]
+use std::{
+	io::SeekFrom,
 	sync::Arc,
 };
 
@@ -8,16 +11,18 @@ use anyhow::{
 	Context,
 	bail,
 };
-use bytes::Bytes;
 use lib::{
 	ArchivedClientMessage,
 	MAX_DATA_FRAME_SIZE,
 	PacketError,
 	PacketHandler,
-	format_bytes,
 };
+#[cfg(test)]
+use lib::format_bytes;
 use quinn::RecvStream;
 use rkyv::rancor;
+use tokio::sync::mpsc::Sender;
+#[cfg(test)]
 use tokio::{
 	fs::OpenOptions,
 	io::{
@@ -26,8 +31,13 @@ use tokio::{
 	},
 	sync::Mutex,
 };
+#[cfg(test)]
 use tracing::info;
 
+use super::{
+	write::WriteJob,
+};
+#[cfg(test)]
 use super::{
 	progress::{
 		SharedReceiveProgress,
@@ -37,11 +47,12 @@ use super::{
 };
 use crate::IncomingTransfer;
 
+#[cfg(test)]
 pub(super) type SharedReceiveState = Arc<Mutex<ReceiveState>>;
 
 pub struct ReceiveState {
 	pub(super) transfers: std::collections::HashMap<u32, IncomingTransfer>,
-	resume_path: PathBuf,
+	pub(super) resume_path: PathBuf,
 	pub(super) dirty: bool,
 }
 
@@ -50,6 +61,7 @@ impl ReceiveState {
 		Self { transfers, resume_path, dirty: false }
 	}
 
+	#[cfg(test)]
 	fn mark_dirty(&mut self) {
 		self.dirty = true;
 	}
@@ -59,7 +71,7 @@ struct DataStreamHandler;
 
 impl PacketHandler for DataStreamHandler {}
 
-pub(super) async fn receive_data_chunks(mut recv: RecvStream, receive_state: SharedReceiveState, progress: SharedReceiveProgress) -> anyhow::Result<()> {
+pub(super) async fn receive_data_chunks(mut recv: RecvStream, tx: Sender<WriteJob>) -> anyhow::Result<()> {
 	loop {
 		let frame = match DataStreamHandler::read_frame(&mut recv, MAX_DATA_FRAME_SIZE).await {
 			Ok(frame) => frame,
@@ -75,13 +87,21 @@ pub(super) async fn receive_data_chunks(mut recv: RecvStream, receive_state: Sha
 
 		match message {
 			ArchivedClientMessage::Chunk { file_id, offset, bytes } => {
-				write_chunk(receive_state.clone(), progress.clone(), file_id.to_native(), offset.to_native(), bytes).await?;
+				let bytes = frame.slice_ref(bytes);
+				tx.send(WriteJob {
+					file_id: file_id.to_native(),
+					offset: offset.to_native(),
+					bytes,
+				})
+				.await
+				.context("Failed to queue chunk for writer")?;
 			}
 			message => bail!("Unexpected message in data stream: {message:?}"),
 		}
 	}
 }
 
+#[cfg(test)]
 pub(super) async fn write_chunk(receive_state: SharedReceiveState, progress: SharedReceiveProgress, file_id: u32, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
 	let mut state = receive_state.lock().await;
 	let Some(transfer) = state.transfers.get_mut(&file_id) else {
@@ -104,7 +124,7 @@ pub(super) async fn write_chunk(receive_state: SharedReceiveState, progress: Sha
 	}
 
 	let expected_len = (transfer.file_size - offset).min(transfer.chunk_size) as usize;
-	let bytes = transfer.compression.decompress(Bytes::copy_from_slice(bytes), expected_len).context("Failed to decompress chunk")?;
+	let bytes = transfer.compression.decompress_slice(bytes, expected_len).context("Failed to decompress chunk")?;
 
 	let len = bytes.len() as u64;
 	if len > transfer.chunk_size {
@@ -136,6 +156,7 @@ pub(super) async fn write_chunk(receive_state: SharedReceiveState, progress: Sha
 	transfer.received_bytes += len;
 	let wrote_file = if !transfer.completed && transfer.received_bytes >= transfer.file_size {
 		transfer.completed = true;
+		transfer.file.as_mut().unwrap().flush().await?;
 		Some((transfer.path.clone(), transfer.file_size))
 	} else {
 		None
@@ -151,6 +172,7 @@ pub(super) async fn write_chunk(receive_state: SharedReceiveState, progress: Sha
 	Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn persist_resume_metadata_on_disconnect(receive_state: &SharedReceiveState) -> anyhow::Result<()> {
 	let mut receive_state = receive_state.lock().await;
 	if !receive_state.dirty {

@@ -5,7 +5,6 @@ use std::{
 		Formatter,
 	},
 	path::PathBuf,
-	sync::Arc,
 };
 
 use anyhow::{
@@ -28,22 +27,31 @@ use quinn::{
 };
 use rkyv::rancor;
 use tokio::{
-	sync::Mutex,
-	task::JoinSet,
+	sync::mpsc,
+	task::{
+		JoinHandle,
+		JoinSet,
+	},
 };
+#[cfg(test)]
+use tokio::sync::Mutex;
 
 mod manifest;
 mod progress;
 mod receive;
 mod resume;
+mod write;
 
 use progress::{
 	ReceiveProgress,
 	log_receiving_start,
 };
 pub use receive::ReceiveState;
-use receive::SharedReceiveState;
 use resume::METADATA_FILE as RESUME_METADATA_FILE;
+use write::{
+	Writer,
+	WriterResult,
+};
 
 pub struct ServerSession {
 	conn: quinn::Connection,
@@ -114,20 +122,23 @@ impl ServerSession {
 					let accepted = transfers.keys().copied().collect::<HashSet<_>>();
 					let receive_progress = ReceiveProgress::shared(&transfers);
 					log_receiving_start(transfers.len(), Compression::from(compression), &receive_progress);
-					let receive_state = Arc::new(Mutex::new(ReceiveState::new(transfers, resume_path)));
+					let receive_state = ReceiveState::new(transfers, resume_path);
+					let (tx, rx) = mpsc::channel(1024);
+					let writer = Writer::new(receive_state, receive_progress.clone());
+					let writer = tokio::spawn(writer.run_worker(rx));
 					let mut streams = JoinSet::new();
 					for _ in 0..lib::DATA_STREAM_COUNT {
 						let conn = self.conn.clone();
-						let receive_state = receive_state.clone();
-						let receive_progress = receive_progress.clone();
+						let tx = tx.clone();
 
 						streams.spawn(async move {
 							let recv = conn.accept_uni().await.context("Failed to accept uni stream")?;
-							receive::receive_data_chunks(recv, receive_state, receive_progress).await
+							receive::receive_data_chunks(recv, tx).await
 						});
 					}
+					drop(tx);
 
-					self.state = ServerState::ReceivingFiles { streams, receive_state };
+					self.state = ServerState::ReceivingFiles { streams, writer };
 					ServerMessage::TransfersRegistered { accepted, rejected, received_chunks }
 				};
 
@@ -140,29 +151,39 @@ impl ServerSession {
 	}
 
 	async fn finish_and_reconcile(&mut self) -> anyhow::Result<()> {
-		let receive_state = {
-			let ServerState::ReceivingFiles { ref mut streams, ref receive_state } = self.state else {
+		let mut receive_state = {
+			let ServerState::ReceivingFiles { ref mut streams, ref mut writer } = self.state else {
 				bail!("Unexpected state in finish and reconcile: {}", self.state);
 			};
 
 			while let Some(result) = streams.join_next().await {
 				if let Err(err) = result? {
-					receive::persist_resume_metadata_on_disconnect(receive_state).await?;
+					streams.abort_all();
+					let writer_result = await_writer(writer).await?;
+					let mut receive_state = writer_result.receive_state;
+					write::persist_resume_metadata_on_disconnect(&mut receive_state).await?;
+					writer_result.result?;
 					return Err(err);
 				}
 			}
 
-			receive_state.clone()
+			let writer_result = await_writer(writer).await?;
+			let mut receive_state = writer_result.receive_state;
+			if let Err(err) = writer_result.result {
+				write::persist_resume_metadata_on_disconnect(&mut receive_state).await?;
+				return Err(err);
+			}
+			receive_state
 		};
 
 		match self.read_control().await {
 			Ok(ClientMessage::TransferFinished) => {}
 			Ok(message) => {
-				receive::persist_resume_metadata_on_disconnect(&receive_state).await?;
+				write::persist_resume_metadata_on_disconnect(&mut receive_state).await?;
 				bail!("Unexpected message in finish and reconcile: {message:?}");
 			}
 			Err(err) => {
-				receive::persist_resume_metadata_on_disconnect(&receive_state).await?;
+				write::persist_resume_metadata_on_disconnect(&mut receive_state).await?;
 				return Err(err);
 			}
 		}
@@ -223,13 +244,14 @@ impl ServerSession {
 	}
 }
 
-pub enum ServerState {
+#[allow(dead_code)]
+enum ServerState {
 	Handshaking,
 	Idle,
 	RegisteringTransfers,
 	ReceivingFiles {
 		streams: JoinSet<anyhow::Result<()>>,
-		receive_state: SharedReceiveState,
+		writer: JoinHandle<WriterResult>,
 	},
 	ReportingMissingChunks,
 }
@@ -248,3 +270,7 @@ impl Display for ServerState {
 
 #[cfg(test)]
 mod tests;
+
+async fn await_writer(writer: &mut JoinHandle<WriterResult>) -> anyhow::Result<WriterResult> {
+	writer.await.context("Writer task panicked or was cancelled")
+}

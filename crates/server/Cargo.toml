@@ -14,3 +14,4 @@ tracing.workspace = true
 bytes.workspace = true
 rkyv.workspace = true
 lz4_flex.workspace = true
+thiserror.workspace = true

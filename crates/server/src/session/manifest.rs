@@ -59,6 +59,7 @@ where
 			compression,
 			received_bytes: 0,
 			completed: false,
+			#[cfg(test)]
 			file: None,
 			received: Default::default(),
 		};

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use bytes::Bytes;
 use lz4_flex::block::DecompressError;
 use thiserror::Error;
@@ -36,6 +38,13 @@ impl Compression {
 		}
 	}
 
+	pub fn compress_slice<'a>(&self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+		match self {
+			Compression::None => Cow::Borrowed(bytes),
+			Compression::LZ4 => Cow::Owned(lz4_flex::block::compress(bytes)),
+		}
+	}
+
 	pub fn decompress(&self, bytes: Bytes, expected_len: usize) -> Result<Bytes, CompressionError> {
 		match self {
 			Compression::None => {
@@ -50,6 +59,25 @@ impl Compression {
 			}
 			Compression::LZ4 => match lz4_flex::block::decompress(bytes.as_ref(), expected_len) {
 				Ok(decompressed) => Ok(Bytes::from(decompressed)),
+				Err(e) => Err(CompressionError::LZ4(e)),
+			},
+		}
+	}
+
+	pub fn decompress_slice<'a>(&self, bytes: &'a [u8], expected_len: usize) -> Result<Cow<'a, [u8]>, CompressionError> {
+		match self {
+			Compression::None => {
+				if bytes.len() == expected_len {
+					Ok(Cow::Borrowed(bytes))
+				} else {
+					Err(CompressionError::LengthMismatch {
+						expected: expected_len,
+						actual: bytes.len(),
+					})
+				}
+			}
+			Compression::LZ4 => match lz4_flex::block::decompress(bytes, expected_len) {
+				Ok(decompressed) => Ok(Cow::Owned(decompressed)),
 				Err(e) => Err(CompressionError::LZ4(e)),
 			},
 		}

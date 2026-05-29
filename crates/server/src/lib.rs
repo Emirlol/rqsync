@@ -69,6 +69,7 @@ struct IncomingTransfer {
 	received_bytes: u64,
 	completed: bool,
 	// Lazily populated on first chunk
+	#[cfg(test)]
 	file: Option<tokio::fs::File>,
 	received: BitSet<u64>,
 }
