@@ -17,9 +17,9 @@ use std::{
 };
 
 use anyhow::{
+	Context,
 	bail,
 	ensure,
-	Context,
 };
 use bit_set::BitSet;
 use bytes::{
@@ -27,16 +27,16 @@ use bytes::{
 	BytesMut,
 };
 use lib::{
-	format_bytes,
-	progress_bar,
 	ClientMessage,
 	Compression,
 	FileManifestEntry,
+	MAX_CONTROL_FRAME_SIZE,
 	PacketHandler,
 	ReceivedChunks,
 	RejectedTransfer,
 	ServerMessage,
-	MAX_CONTROL_FRAME_SIZE,
+	format_bytes,
+	progress_bar,
 };
 use rayon::{
 	iter::ParallelIterator,
@@ -395,8 +395,8 @@ impl ClientSession {
 		let mut file = File::open(&job.source_path).await?;
 		file.seek(SeekFrom::Start(job.offset)).await?;
 
-		let mut buf = BytesMut::zeroed(job.uncompressed_len as usize);
-		file.read_exact(&mut buf).await?;
+		let mut buf = BytesMut::with_capacity(job.uncompressed_len as usize);
+		file.take(job.uncompressed_len).read_buf(&mut buf).await?;
 
 		Ok(buf.freeze())
 	}
@@ -556,7 +556,7 @@ mod tests {
 
 	fn test_dir(name: &str) -> PathBuf {
 		let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-		let path = std::env::temp_dir().join(format!("speedtest-client-{name}-{}-{nanos}", std::process::id()));
+		let path = std::env::temp_dir().join(format!("rqsync-client-{name}-{}-{nanos}", std::process::id()));
 		fs::create_dir_all(&path).unwrap();
 		path
 	}

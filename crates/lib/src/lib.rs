@@ -203,10 +203,10 @@ pub fn progress_bar(completed: u64, total: u64) -> String {
 
 #[derive(Debug, Error)]
 pub enum PacketError {
-	#[error("Packet too large: expected {expected} bytes, got {actual}")]
+	#[error("Frame too large: expected {expected} bytes, got {actual}")]
 	FrameTooLarge { expected: usize, actual: usize },
 	#[error("Quinn read error: {0:?}")]
-	ReadExactError(#[from] quinn::ReadExactError),
+	ReadError(#[from] quinn::ReadExactError),
 	#[error("Quinn write error: {0:?}")]
 	WriteError(#[from] quinn::WriteError),
 }
@@ -215,14 +215,14 @@ pub enum PacketError {
 pub trait PacketHandler {
 	async fn read_frame(recv: &mut quinn::RecvStream, max_len: usize) -> Result<Bytes, PacketError> {
 		let mut len_buf = [0u8; 4];
-		recv.read_exact(&mut len_buf).await.map_err(PacketError::ReadExactError)?;
+		recv.read_exact(&mut len_buf).await.map_err(PacketError::ReadError)?;
 		let len = u32::from_be_bytes(len_buf) as usize;
 		if len > max_len {
 			return Err(PacketError::FrameTooLarge { expected: max_len, actual: len });
 		}
 
 		let mut buf = BytesMut::zeroed(len);
-		recv.read_exact(&mut buf).await.map_err(PacketError::ReadExactError)?;
+		recv.read_exact(&mut buf).await.map_err(PacketError::ReadError)?;
 		Ok(buf.freeze())
 	}
 

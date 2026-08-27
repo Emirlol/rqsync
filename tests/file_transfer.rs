@@ -35,7 +35,7 @@ use server::ServerConfig;
 
 fn test_dir(name: &str) -> PathBuf {
 	let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-	let path = std::env::temp_dir().join(format!("speedtest-e2e-{name}-{}-{nanos}", std::process::id()));
+	let path = std::env::temp_dir().join(format!("rqsync-e2e-{name}-{}-{nanos}", std::process::id()));
 	fs::create_dir_all(&path).unwrap();
 	path
 }
@@ -170,7 +170,7 @@ async fn interrupted_transfer_resumes_with_different_compression() {
 	tokio::time::sleep(Duration::from_millis(100)).await;
 
 	send_first_chunk_then_disconnect(address, source_file.clone()).await.unwrap();
-	let resume_file = receive_root.join(".speedtest-resume.rkyv");
+	let resume_file = receive_root.join(".rqsync-resume.rkyv");
 	for _ in 0..20 {
 		if resume_file.exists() {
 			break;

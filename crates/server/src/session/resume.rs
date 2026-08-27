@@ -14,8 +14,8 @@ use tokio::fs;
 
 use crate::IncomingTransfer;
 
-pub(super) const METADATA_FILE: &str = ".speedtest-resume.rkyv";
-const METADATA_TEMP_FILE: &str = ".speedtest-resume.rkyv.tmp";
+pub(super) const METADATA_FILE: &str = ".rqsync-resume.rkyv";
+const METADATA_TEMP_FILE: &str = ".rqsync-resume.rkyv.tmp";
 pub(super) const METADATA_VERSION: u32 = 1;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]

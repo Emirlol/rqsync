@@ -39,7 +39,7 @@ pub enum Commands {
 		/// How duplicate files should be handled
 		duplicate_strategy: DuplicateStrategy,
 		/// Compress chunks before sending them
-		#[arg(long, value_enum, default_value_t = Compression::None)]
+		#[arg(long, value_enum, default_value_t = Compression::LZ4)]
 		compression: Compression,
 	},
 }

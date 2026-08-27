@@ -75,7 +75,7 @@ pub(super) async fn receive_data_chunks(mut recv: RecvStream, tx: Sender<WriteJo
 	loop {
 		let frame = match DataStreamHandler::read_frame(&mut recv, MAX_DATA_FRAME_SIZE).await {
 			Ok(frame) => frame,
-			Err(PacketError::ReadExactError(_)) => {
+			Err(PacketError::ReadError(_)) => {
 				return Ok(()); // EOF, probably
 			}
 			Err(err) => {
