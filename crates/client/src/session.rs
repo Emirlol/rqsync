@@ -396,7 +396,21 @@ impl ClientSession {
 		file.seek(SeekFrom::Start(job.offset)).await?;
 
 		let mut buf = BytesMut::with_capacity(job.uncompressed_len as usize);
-		file.take(job.uncompressed_len).read_buf(&mut buf).await?;
+		let mut take = file.take(job.uncompressed_len);
+
+		let expected = job.uncompressed_len as usize;
+		while buf.len() < expected {
+			let n = take.read_buf(&mut buf).await?;
+			if n == 0 {
+				bail!(
+					"Unexpected EOF while reading {} at offset {}: expected {} bytes, got {}",
+					job.source_path.display(),
+					job.offset,
+					expected,
+					buf.len()
+				);
+			}
+		}
 
 		Ok(buf.freeze())
 	}

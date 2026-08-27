@@ -3,10 +3,12 @@ pub mod compression;
 
 use std::{
 	collections::HashSet,
+	future::poll_fn,
 	time::Duration,
 };
 
 use bytes::{
+	BufMut,
 	Bytes,
 	BytesMut,
 };
@@ -16,6 +18,7 @@ use quinn::{
 	VarInt,
 };
 use thiserror::Error;
+use tokio::io::ReadBuf;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const DATA_STREAM_COUNT: usize = 8;
@@ -221,8 +224,25 @@ pub trait PacketHandler {
 			return Err(PacketError::FrameTooLarge { expected: max_len, actual: len });
 		}
 
-		let mut buf = BytesMut::zeroed(len);
-		recv.read_exact(&mut buf).await.map_err(PacketError::ReadError)?;
+		let mut buf = BytesMut::with_capacity(len);
+		while buf.len() < len {
+			let read = {
+				let mut read_buf = ReadBuf::uninit(buf.spare_capacity_mut());
+				poll_fn(|cx| recv.poll_read_buf(cx, &mut read_buf))
+					.await
+					.map_err(|err| PacketError::ReadError(quinn::ReadExactError::ReadError(err)))?;
+				read_buf.filled().len()
+			};
+
+			if read == 0 {
+				return Err(PacketError::ReadError(quinn::ReadExactError::FinishedEarly(buf.len())));
+			}
+
+			unsafe {
+				buf.advance_mut(read);
+			}
+		}
+
 		Ok(buf.freeze())
 	}
 
