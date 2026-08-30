@@ -19,6 +19,7 @@ use quinn::{
 	},
 };
 
+// The main use case is local file transfer, which means there's no need for cert verification. This isn't secure for non-local transfers, but it's good enough for now.
 #[derive(Debug)]
 pub struct SkipServerVerification(Arc<CryptoProvider>);
 
