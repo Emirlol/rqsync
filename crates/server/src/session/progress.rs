@@ -1,9 +1,6 @@
 use std::{
 	collections::HashMap,
-	sync::{
-		Arc,
-		Mutex as StdMutex,
-	},
+	sync::Arc,
 };
 
 use lib::{
@@ -11,11 +8,12 @@ use lib::{
 	format_bytes,
 	progress_bar,
 };
+use parking_lot::Mutex;
 use tracing::info;
 
 use crate::IncomingTransfer;
 
-pub(super) type SharedReceiveProgress = Arc<StdMutex<ReceiveProgress>>;
+pub(super) type SharedReceiveProgress = Arc<Mutex<ReceiveProgress>>;
 
 pub(super) struct ReceiveProgress {
 	total_bytes: u64,
@@ -33,12 +31,12 @@ impl ReceiveProgress {
 	}
 
 	pub(super) fn shared(transfers: &HashMap<u32, IncomingTransfer>) -> SharedReceiveProgress {
-		Arc::new(StdMutex::new(Self::new(transfers)))
+		Arc::new(Mutex::new(Self::new(transfers)))
 	}
 
 	#[cfg(test)]
 	pub(super) fn empty(total_bytes: u64) -> SharedReceiveProgress {
-		Arc::new(StdMutex::new(Self {
+		Arc::new(Mutex::new(Self {
 			total_bytes,
 			completed_bytes: 0,
 			next_report_percent: 5,
@@ -73,7 +71,7 @@ impl ReceiveProgress {
 }
 
 pub(super) fn log_receiving_start(file_count: usize, compression: Compression, progress: &SharedReceiveProgress) {
-	let progress = progress.lock().expect("receive progress lock poisoned");
+	let progress = progress.lock();
 	info!(
 		"Receiving {} files ({}) with {:?} compression {}",
 		file_count,
@@ -84,7 +82,7 @@ pub(super) fn log_receiving_start(file_count: usize, compression: Compression, p
 }
 
 pub(super) fn record_written(progress: &SharedReceiveProgress, bytes: u64) {
-	let message = progress.lock().expect("receive progress lock poisoned").record_written(bytes);
+	let message = progress.lock().record_written(bytes);
 	if let Some(message) = message {
 		info!("{message}");
 	}

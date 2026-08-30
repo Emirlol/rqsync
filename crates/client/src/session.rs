@@ -10,10 +10,7 @@ use std::{
 		Path,
 		PathBuf,
 	},
-	sync::{
-		Arc,
-		Mutex as StdMutex,
-	},
+	sync::Arc,
 };
 
 use anyhow::{
@@ -26,6 +23,7 @@ use bytes::{
 	Bytes,
 	BytesMut,
 };
+use parking_lot::Mutex;
 use lib::{
 	ClientMessage,
 	Compression,
@@ -158,6 +156,7 @@ impl SendProgress {
 		messages
 	}
 
+	#[inline(always)]
 	fn percent_complete(&self) -> u64 {
 		if self.total_bytes == 0 {
 			100
@@ -167,8 +166,8 @@ impl SendProgress {
 	}
 }
 
-fn record_sent(progress: &Arc<StdMutex<SendProgress>>, file_id: u32, bytes: u64) {
-	let messages = progress.lock().expect("send progress lock poisoned").record_sent(file_id, bytes);
+fn record_sent(progress: &Arc<Mutex<SendProgress>>, file_id: u32, bytes: u64) {
+	let messages = progress.lock().record_sent(file_id, bytes);
 	for message in messages {
 		info!("{message}");
 	}
@@ -240,12 +239,12 @@ impl ClientSession {
 		ensure!(matches!(self.state, ClientState::SendingFiles));
 
 		let resumed = Self::received_chunks_by_file(received_chunks);
-		let progress = Arc::new(StdMutex::new(SendProgress::new(&self.files, &accepted, &resumed)));
+		let progress = Arc::new(Mutex::new(SendProgress::new(&self.files, &accepted, &resumed)));
 		let (accepted_files, total_bytes) = {
-			let progress = progress.lock().expect("send progress lock poisoned");
+			let progress = progress.lock();
 			(progress.files.len(), progress.total_bytes)
 		};
-		let completed_bytes = progress.lock().expect("send progress lock poisoned").completed_bytes;
+		let completed_bytes = progress.lock().completed_bytes;
 		info!(
 			"Sending {accepted_files} files ({}) with {:?} compression {}",
 			format_bytes(total_bytes),

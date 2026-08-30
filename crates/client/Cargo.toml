@@ -15,3 +15,4 @@ walkdir.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 bit-set.workspace = true
+parking_lot.workspace = true

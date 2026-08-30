@@ -6,7 +6,7 @@ use std::{
 	io::SeekFrom,
 	sync::Arc,
 };
-
+use std::collections::HashMap;
 use anyhow::{
 	Context,
 	bail,
@@ -51,13 +51,13 @@ use crate::IncomingTransfer;
 pub(super) type SharedReceiveState = Arc<Mutex<ReceiveState>>;
 
 pub struct ReceiveState {
-	pub(super) transfers: std::collections::HashMap<u32, IncomingTransfer>,
+	pub(super) transfers: HashMap<u32, IncomingTransfer>,
 	pub(super) resume_path: PathBuf,
 	pub(super) dirty: bool,
 }
 
 impl ReceiveState {
-	pub(super) fn new(transfers: std::collections::HashMap<u32, IncomingTransfer>, resume_path: PathBuf) -> Self {
+	pub(super) fn new(transfers: HashMap<u32, IncomingTransfer>, resume_path: PathBuf) -> Self {
 		Self { transfers, resume_path, dirty: false }
 	}
 
