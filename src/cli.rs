@@ -27,7 +27,7 @@ pub enum Commands {
 		/// The address to listen on.
 		address: SocketAddr,
 		/// Root file directory to put received files in.
-		#[arg(long, value_name = "DIR", default_value = ".")]
+		#[arg(short, long, value_name = "DIR", default_value = ".")]
 		root_dir: PathBuf,
 	},
 	/// Runs in sender mode
@@ -37,9 +37,10 @@ pub enum Commands {
 		/// The files to send
 		files: Vec<PathBuf>,
 		/// How duplicate files should be handled
+		#[arg(short, long, value_enum, default_value_t = DuplicateStrategy::Reject)]
 		duplicate_strategy: DuplicateStrategy,
 		/// Compress chunks before sending them
-		#[arg(long, value_enum, default_value_t = Compression::LZ4)]
+		#[arg(short, long, value_enum, default_value_t = Compression::LZ4)]
 		compression: Compression,
 	},
 }
